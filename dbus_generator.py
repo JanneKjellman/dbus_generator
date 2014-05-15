@@ -20,18 +20,21 @@ import logging
 import datetime
 import platform
 import dbus
-from os import path, pardir
+from os import path, pardir, system
 import sys
 
 # Victron imports
-sys.path.append('ext/velib_python')
+#sys.path.append('ext/velib_python')
 from dbusmonitor import DbusMonitor
-from vedbus import VeDbusService
+from vedbus import VeDbusItemExport, VeDbusService
 from settingsdevice import SettingsDevice
 
 
 softwareversion = '0.10'
 dbusgenerator = None
+genlaststate = 0
+
+relayFile = "/sys/class/gpio/gpio182/value"
 
 
 class DbusGenerator:
@@ -42,6 +45,7 @@ class DbusGenerator:
 			bus=dbus.SystemBus() if (platform.machine() == 'armv7l') else dbus.SessionBus(),
 			supportedSettings={
 				'batteryinstance': ['/Settings/Generator/BatteryInstance', 0, 0, 1000],
+				'running': ['/Settings/Generator/Running', 0, 0, 1],
 				'autostopsoc': ['/Settings/Generator/AutoStopSOC', 90, 0, 100],
 				'autostartsoc': ['/Settings/Generator/AutoStartSOC', 10, 0, 100],
 				'autostartcurrent': ['/Settings/Generator/AutoStartCurrent', 0, 0, 500]
@@ -91,6 +95,7 @@ class DbusGenerator:
 				# TODO, do we want an error for invalid soc?, genset stopped (? or do some other logic?)
 	#			self._dbusservice.add_path('/Error', None)
 
+
 			# Is our battery instance available?
 			batteries = self._dbusmonitor.get_service_list('com.victronenergy.battery')
 			if self._settings['batteryinstance'] in batteries:
@@ -137,20 +142,44 @@ running, it will be stopped now" % self._settings['batteryinstance'])
 		elif dbusServiceName == 'com.victronenergy.settings':
 			self._evaluate_if_we_are_needed()
 
-	def _handle_changed_setting(setting, oldvalue, newvalue):
+	def _handle_changed_setting(self, setting, oldvalue, newvalue):
+		logging.info("handle changed setting called")
 		self._evaluate_startstop_conditions()
 
 	def _evaluate_startstop_conditions(self):
+		global genlaststate
 		logging.info("soc: %s" % (self.battery_soc()))
 		if self.battery_soc() is None:
 			logging.warning("invalid soc! stopping genset!")
 			self.stop_genset()
 			return
 
-		if self.battery_soc() <= self._settings['autostartsoc']:
+		if (genlaststate != self._settings['running']):
+			if (self._settings['running'] == 0):
+				logging.info("manual stop")
+				self.stop_genset()
+				genlaststate = 0
+				return
+			else:
+				if (self.battery_soc() < self._settings['autostopsoc']):
+					logging.info("manual start")
+					self.start_genset()
+					genlaststate = 1
+					return
+				else:
+					self.stop_genset()
+					genlaststate = 0
+					return
+				return
+
+			return
+
+		# check that the setting is not 0=disabled and then check the values
+		if (self._settings['autostartsoc'] != 0 and self.battery_soc() <= self._settings['autostartsoc']):
 			self.start_genset()
 
-		if self.battery_soc() >= self._settings['autostopsoc']:
+		# check that the setting is not 0=disabled and then check the values
+		if (self._settings['autostopsoc'] != 0 and self.battery_soc() >= self._settings['autostopsoc']):
 			self.stop_genset()
 
 	def battery_soc(self):
@@ -162,14 +191,25 @@ running, it will be stopped now" % self._settings['batteryinstance'])
 		return int(current) if current is not None else None
 
 	def start_genset(self):
-		logging.info("TODO: implement starting the genset")
-	#	self._dbusservice['/State'] = 1
+		global genlaststate
+		logging.info("Turning on relay and starting genset")
+		relayfile = file(relayFile, 'w')                                             
+		relayfile.write('1\n')                                                       
+		relayfile.close()    
+		system("/usr/bin/dbus -y com.victronenergy.settings /Settings/Generator/Running SetValue 1")
+		genlaststate = 1
 
 	def stop_genset(self):
-		logging.info("TODO: implement stopping the genset")
-	#	self._dbusservice['/State'] = 0
+		global genlaststate
+		logging.info("Turning off relay and stopping genset")
+		relayfile = file(relayFile, 'w')                                             
+		relayfile.write('0\n')                                                       
+		relayfile.close()    
+		system("/usr/bin/dbus -y com.victronenergy.settings /Settings/Generator/Running SetValue 0")
+		genlaststate = 0
 
 def main():
+
 	# Argument parsing
 	parser = argparse.ArgumentParser(
 		description= 'dbus_generator auto starts/stops a genset based on battery status'
